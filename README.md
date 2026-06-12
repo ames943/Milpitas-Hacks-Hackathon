@@ -4,7 +4,7 @@
 
 ## What it does
 
-<!-- Describe your project in 2-3 sentences. What problem does it solve? Who is it for? -->
+<!-- Describe your project in 2-4 sentences. What problem does it solve? Who is it for? -->
 
 ## Demo
 
