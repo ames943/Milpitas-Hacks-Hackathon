@@ -27,24 +27,25 @@ import {
   sampleVariance,
 } from '../lib/audioFeatures';
 import { parseSleepRows, computeSleepStats } from '../lib/sleepStats';
+import { validateUUID } from '../lib/utils';
 
-// Set ffmpeg binary path once at module load time.
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
 const router = Router();
-const SIGNAL_CONFIDENCE = 20; // Each signal type contributes 20 points to confidence.
+const SIGNAL_CONFIDENCE = 20;
 
-// ── Multer instances (one per route with independent size limits) ──────────────
+const VALID_SIGNAL_TYPES = new Set(['transcript', 'sleep', 'voice']);
+
+// ── Multer instances ──────────────────────────────────────────────────────────
 
 function upload(limitBytes: number) {
   return multer({ storage: multer.memoryStorage(), limits: { fileSize: limitBytes } });
 }
 
 const uploadPdf   = upload(10 * 1024 * 1024).single('file'); // 10 MB
-const uploadCsv   = upload(2  * 1024 * 1024).single('file'); //  2 MB
-const uploadAudio = upload(5  * 1024 * 1024).single('file'); //  5 MB
+const uploadCsv   = upload(5  * 1024 * 1024).single('file'); //  5 MB (spec: 5 MB)
+const uploadAudio = upload(25 * 1024 * 1024).single('file'); // 25 MB (spec: 25 MB)
 
-/** Wraps a multer RequestHandler in a Promise for use in async route handlers. */
 function runUpload(
   middleware: (req: Request, res: Response, cb: (err?: unknown) => void) => void,
   req: Request,
@@ -67,7 +68,6 @@ function handleMulterError(err: unknown, limitLabel: string, res: Response): boo
   return false;
 }
 
-/** Validates that a prior dimension_scores row exists (survey must come first). */
 function requirePriorScores(
   latest: Awaited<ReturnType<typeof getLatestDimensionScores>>,
   res: Response,
@@ -82,10 +82,6 @@ function requirePriorScores(
   return true;
 }
 
-/**
- * Inserts a signal_data row for the given user.
- * raw_data and processed_data are stored as JSONB.
- */
 async function storeSignalData(
   userId: string,
   signalType: 'transcript' | 'sleep' | 'voice',
@@ -122,11 +118,6 @@ const AUDIO_MIME_TO_EXT: Record<string, string> = {
 const WAV_MIMES = new Set(['audio/wav', 'audio/x-wav', 'audio/wave']);
 const ACCEPTED_AUDIO_MIMES = new Set([...Object.keys(AUDIO_MIME_TO_EXT), ...WAV_MIMES]);
 
-/**
- * Converts an audio buffer to a 44100 Hz mono 16-bit PCM WAV buffer using ffmpeg.
- * Output at 44100 Hz ensures 20ms frames (882 samples) cover the ≥100 Hz pitch
- * detection range that fits within the YIN autocorrelation window.
- */
 async function convertToWav(inputBuffer: Buffer, inputExt: string): Promise<Buffer> {
   if (!ffmpegPath) throw new Error('ffmpeg-static binary not found');
 
@@ -140,9 +131,9 @@ async function convertToWav(inputBuffer: Buffer, inputExt: string): Promise<Buff
     await new Promise<void>((resolve, reject) => {
       ffmpeg(inputPath)
         .noVideo()
-        .audioChannels(1)          // mono
-        .audioFrequency(44100)     // 44.1 kHz for pitch detection coverage
-        .audioCodec('pcm_s16le')   // 16-bit signed PCM
+        .audioChannels(1)
+        .audioFrequency(44100)
+        .audioCodec('pcm_s16le')
         .format('wav')
         .on('end', () => resolve())
         .on('error', (err: Error) => reject(err))
@@ -157,6 +148,125 @@ async function convertToWav(inputBuffer: Buffer, inputExt: string): Promise<Buff
     ]);
   }
 }
+
+// ── GET /api/signals/voice/prompt ─────────────────────────────────────────────
+// Must be registered BEFORE POST /voice to avoid method confusion.
+
+router.get('/voice/prompt', (_req: Request, res: Response) => {
+  return res.status(200).json({
+    success: true,
+    data: {
+      prompt: (
+        'Please speak naturally for about 60 seconds. You might describe what your past week has ' +
+        'been like — what you worked on, how you felt about it, and what\'s on your mind right now. ' +
+        'There are no right or wrong answers. Just talk as you normally would.'
+      ),
+      duration_seconds: 60,
+      tips: [
+        'Find a quiet space if you can',
+        'Speak at your normal pace — no need to slow down or speed up',
+        "It's okay to pause or collect your thoughts",
+      ],
+    },
+  });
+});
+
+// ── DELETE /api/signals/:userId/:type ─────────────────────────────────────────
+// Soft-deletes all active signal rows of the given type, then recalculates
+// confidence and inserts a new dimension_scores snapshot.
+
+router.delete(
+  '/:userId/:type',
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { userId, type } = req.params;
+
+    if (!validateUUID(userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid ID format' });
+    }
+    if (!VALID_SIGNAL_TYPES.has(type)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid signal type "${type}". Valid: transcript, sleep, voice`,
+      });
+    }
+
+    try {
+      // Survey-first gate
+      const latest = await getLatestDimensionScores(userId);
+      if (!latest) {
+        return res.status(409).json({
+          success: false,
+          error: 'No dimension scores found for this user. Please complete the survey first.',
+        });
+      }
+
+      // Find active rows of this type
+      const { data: active, error: findErr } = await supabase
+        .from('signal_data')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('signal_type', type)
+        .is('deleted_at', null);
+
+      if (findErr) throw findErr;
+      if (!active || active.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: `No active ${type} signal found for this user`,
+        });
+      }
+
+      // Soft-delete
+      const ids = active.map((r: { id: string }) => r.id);
+      const { error: delErr } = await supabase
+        .from('signal_data')
+        .update({ deleted_at: new Date().toISOString() })
+        .in('id', ids);
+      if (delErr) throw delErr;
+
+      // Recalculate confidence from remaining active signals
+      const { data: remaining, error: remainErr } = await supabase
+        .from('signal_data')
+        .select('signal_type')
+        .eq('user_id', userId)
+        .is('deleted_at', null);
+
+      if (remainErr) throw remainErr;
+
+      const activeTypes = new Set(
+        (remaining ?? []).map((s: { signal_type: string }) => s.signal_type as string),
+      );
+      const newConfidence = 40 + activeTypes.size * 20; // survey baseline + 20 per signal type
+
+      // Insert new snapshot reflecting the deletion (same dimension values, updated confidence)
+      const { data: newDim, error: dimErr } = await supabase
+        .from('dimension_scores')
+        .insert({
+          user_id:              userId,
+          cognitive_load:       Number(latest.cognitive_load),
+          emotional_regulation: Number(latest.emotional_regulation),
+          recovery_capacity:    Number(latest.recovery_capacity),
+          confidence_score:     newConfidence,
+          explanation_text:     `${type} signal removed. Confidence recalculated from remaining active signals.`,
+        })
+        .select()
+        .single();
+
+      if (dimErr) throw dimErr;
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          deleted_count:      ids.length,
+          new_confidence_score: newConfidence,
+          dimension_scores:   newDim,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. POST /api/signals/transcript
@@ -186,7 +296,6 @@ router.post('/transcript', async (req: Request, res: Response, next: NextFunctio
       });
     }
 
-    // Extract text from PDF.
     const parsed = await pdfParse(req.file.buffer);
     const extractedText = parsed.text ?? '';
     if (extractedText.trim().length < 50) {
@@ -198,11 +307,9 @@ router.post('/transcript', async (req: Request, res: Response, next: NextFunctio
       });
     }
 
-    // Check survey prerequisite.
     const latest = await getLatestDimensionScores(user_id);
     if (!requirePriorScores(latest, res)) return;
 
-    // Call Claude to extract structured academic data.
     let transcriptData: Awaited<ReturnType<typeof extractTranscriptData>>;
     try {
       transcriptData = await extractTranscriptData(extractedText);
@@ -220,7 +327,6 @@ router.post('/transcript', async (req: Request, res: Response, next: NextFunctio
       throw err;
     }
 
-    // Compute cognitive_load adjustment.
     const new_cognitive_load = computeNewCognitiveLoad(
       Number(latest.cognitive_load),
       transcriptData.grade_trend,
@@ -228,11 +334,9 @@ router.post('/transcript', async (req: Request, res: Response, next: NextFunctio
       transcriptData.has_ap_honors,
     );
 
-    // Persist signal and new dimension snapshot.
     const signalId = await storeSignalData(
       user_id,
       'transcript',
-      // Raw: extracted text truncated to 5000 chars for storage.
       { text: extractedText.substring(0, 5000), original_filename: req.file.originalname },
       transcriptData as unknown as Record<string, unknown>,
     );
@@ -268,7 +372,7 @@ router.post('/sleep', async (req: Request, res: Response, next: NextFunction) =>
   try {
     await runUpload(uploadCsv, req, res);
   } catch (err) {
-    if (handleMulterError(err, '2 MB', res)) return;
+    if (handleMulterError(err, '5 MB', res)) return;
     return next(err);
   }
 
@@ -315,7 +419,6 @@ router.post('/sleep', async (req: Request, res: Response, next: NextFunction) =>
 
     const stats = computeSleepStats(parsedSleep.nights);
 
-    // Check survey prerequisite.
     const latest = await getLatestDimensionScores(user_id);
     if (!requirePriorScores(latest, res)) return;
 
@@ -328,7 +431,6 @@ router.post('/sleep', async (req: Request, res: Response, next: NextFunction) =>
     const signalId = await storeSignalData(
       user_id,
       'sleep',
-      // Raw rows: cap at 100 for storage.
       { rows: parsedSleep.nights.slice(0, 100), source_columns: { date: parsedSleep.dateColumn, duration: parsedSleep.durationColumn } },
       {
         avg_sleep_hours: Math.round(stats.avg_sleep_hours * 100) / 100,
@@ -372,7 +474,7 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
   try {
     await runUpload(uploadAudio, req, res);
   } catch (err) {
-    if (handleMulterError(err, '5 MB', res)) return;
+    if (handleMulterError(err, '25 MB', res)) return;
     return next(err);
   }
 
@@ -394,7 +496,6 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
       });
     }
 
-    // Decode to PCM: WAV files decode directly; others go through ffmpeg first.
     let wavBuffer: Buffer;
     try {
       if (WAV_MIMES.has(mimeType)) {
@@ -411,7 +512,7 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
     }
 
     const decoded = wav.decode(wavBuffer);
-    const samples = decoded.channelData[0]; // Float32Array in [-1, 1]
+    const samples = decoded.channelData[0];
     const sampleRate = decoded.sampleRate;
     const durationSeconds = samples.length / sampleRate;
 
@@ -422,12 +523,9 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
       });
     }
 
-    // ── Short-time energy analysis (20ms frames) ─────────────────────────────
-    // Frame size: 20ms — per spec. At 44100 Hz this is 882 samples.
     const frameSize = Math.round(sampleRate * 0.02);
     const energies = computeFrameEnergies(samples, frameSize);
 
-    // Guard: truly silent audio (max energy near zero) can't be analyzed.
     const maxEnergy = Math.max(...Array.from(energies));
     if (maxEnergy < 1e-8) {
       return res.status(422).json({ success: false, error: 'Audio appears to be silent.' });
@@ -447,10 +545,6 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
     const speaking_ratio = voicedCount / voiced.length;
     const num_pauses = countPauses(voiced, sampleRate, frameSize);
 
-    // ── Pitch detection on voiced frames (YIN algorithm) ─────────────────────
-    // Filter: 100-500 Hz human voice F0 range. Lower bound is 100 Hz because
-    // 20ms frames at 44100 Hz (882 samples) allow reliable detection ≥ 100 Hz.
-    // Very low male voices (<100 Hz) are outside this range — documented limitation.
     const detectPitch = pitchfinder.YIN({ sampleRate, threshold: 0.1 });
     const pitchValues: number[] = [];
     const voicedEnergies: number[] = [];
@@ -466,9 +560,6 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
       }
     }
 
-    // pitch_variance_hz = sample variance of F0 across voiced frames (in Hz).
-    // Lower variance → flatter affect — proxy for emotional expressiveness.
-    // NOT a clinical measure; appropriate hedging required in UI (see signalAdjustments.ts).
     const pitch_variance_hz = sampleVariance(pitchValues);
     const energy_variance    = sampleVariance(voicedEnergies);
     const frames_analyzed    = voiced.length;
@@ -482,7 +573,6 @@ router.post('/voice', async (req: Request, res: Response, next: NextFunction) =>
       frames_analyzed,
     };
 
-    // Check survey prerequisite.
     const latest = await getLatestDimensionScores(user_id);
     if (!requirePriorScores(latest, res)) return;
 

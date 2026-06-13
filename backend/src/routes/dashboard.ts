@@ -3,6 +3,8 @@ import { supabase } from '../lib/supabase';
 import { getLatestDimensionScores } from '../lib/dimensionUpdate';
 import { callAI } from '../lib/aiClient';
 import { dimensionColor, buildConfidenceBreakdown } from '../lib/dashboardHelpers';
+import { getAssistantId, searchMemories } from '../lib/backboardMemory';
+import { validateUUID } from '../lib/utils';
 
 const router = Router();
 
@@ -11,8 +13,6 @@ const DISCLAIMER =
 
 const AI_FALLBACK = "We're still analyzing this dimension.";
 
-// ── Explanation system prompt ─────────────────────────────────────────────────
-// Shared across all three dimension calls; the user prompt provides the data.
 const EXPLANATION_SYSTEM_PROMPT = `You are a caring student wellbeing advisor reviewing a student's health and academic data. Write exactly ONE sentence in plain, warm language that explains what is most likely driving the student's situation in the dimension described.
 
 Requirements:
@@ -23,11 +23,8 @@ Requirements:
 - One sentence only — no lists, no line breaks
 - Tone: caring school counselor, not a doctor or report`;
 
-// Frequency labels for PHQ-A / GAD-7 Likert scale (0-3)
 const FREQ = ['not at all', 'on several days', 'more than half the days', 'nearly every day'];
 const freq = (v: number): string => FREQ[Math.min(3, Math.max(0, Math.round(v)))] ?? 'unknown';
-
-// ── Per-dimension user prompts ─────────────────────────────────────────────────
 
 type SurveyAnswers = { phq_answers: number[]; gad_answers: number[] };
 
@@ -55,11 +52,17 @@ function buildCognitiveLoadPrompt(
   score: number,
   survey: SurveyAnswers | null,
   transcript: TranscriptProcessed | null,
+  priorContext: string,
 ): string {
-  const lines = [
+  const lines = [];
+  if (priorContext) {
+    lines.push(priorContext);
+    lines.push('');
+  }
+  lines.push(
     `DIMENSION: Cognitive Load — how much mental bandwidth is being consumed`,
     `Current level: ${score <= 33 ? 'low' : score <= 66 ? 'moderate' : 'high'} (${score}/100, where higher means more strain)`,
-  ];
+  );
 
   if (survey) {
     lines.push('\nSelf-reported challenges (from initial survey):');
@@ -89,11 +92,17 @@ function buildEmotionalRegulationPrompt(
   score: number,
   survey: SurveyAnswers | null,
   voice: VoiceProcessed | null,
+  priorContext: string,
 ): string {
-  const lines = [
+  const lines = [];
+  if (priorContext) {
+    lines.push(priorContext);
+    lines.push('');
+  }
+  lines.push(
     `DIMENSION: Emotional Regulation — ability to manage and express emotions`,
     `Current level: ${score >= 67 ? 'good' : score >= 34 ? 'moderate' : 'low'} (${score}/100, where higher means better regulation)`,
-  ];
+  );
 
   if (survey) {
     lines.push('\nSelf-reported feelings (from initial survey):');
@@ -126,11 +135,17 @@ function buildRecoveryCapacityPrompt(
   score: number,
   survey: SurveyAnswers | null,
   sleep: SleepProcessed | null,
+  priorContext: string,
 ): string {
-  const lines = [
+  const lines = [];
+  if (priorContext) {
+    lines.push(priorContext);
+    lines.push('');
+  }
+  lines.push(
     `DIMENSION: Recovery Capacity — ability to physically and mentally recharge`,
     `Current level: ${score >= 67 ? 'good' : score >= 34 ? 'moderate' : 'low'} (${score}/100, where higher means better recovery)`,
-  ];
+  );
 
   if (survey) {
     lines.push('\nSelf-reported recovery challenges (from initial survey):');
@@ -153,12 +168,7 @@ function buildRecoveryCapacityPrompt(
   return lines.join('\n');
 }
 
-// ── Timeout-safe explanation wrapper ─────────────────────────────────────────
-
-async function safeExplain(
-  call: Promise<string>,
-  dimension: string,
-): Promise<string> {
+async function safeExplain(call: Promise<string>, dimension: string): Promise<string> {
   try {
     return await call;
   } catch (err) {
@@ -169,121 +179,136 @@ async function safeExplain(
 
 // ── GET /api/dashboard/:userId ────────────────────────────────────────────────
 
-router.get('/:userId', async (req: Request, res: Response, next: NextFunction) => {
-  const { userId } = req.params;
+router.get(
+  '/:userId',
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { userId } = req.params;
 
-  try {
-    // 1. Latest dimension scores (source of truth for all dimension values)
-    const latest = await getLatestDimensionScores(userId);
-    if (!latest) {
-      return res.status(404).json({
-        success: false,
-        error: 'No scores found for this user. Please complete the initial survey first.',
-      });
+    if (!validateUUID(userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid ID format' });
     }
 
-    // 2. Signal data + latest survey in parallel (both needed for AI context)
-    const [signalsResult, surveyResult] = await Promise.all([
-      supabase
-        .from('signal_data')
-        .select('signal_type, processed_data, confidence_contribution, created_at')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false }),
-      supabase
-        .from('survey_responses')
-        .select('raw_answers, created_at')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1),
-    ]);
+    try {
+      const latest = await getLatestDimensionScores(userId);
+      if (!latest) {
+        return res.status(404).json({
+          success: false,
+          error: 'No scores found for this user. Please complete the initial survey first.',
+        });
+      }
 
-    if (signalsResult.error) throw signalsResult.error;
-    if (surveyResult.error) throw surveyResult.error;
+      // Fetch signals (active only) + survey in parallel
+      const [signalsResult, surveyResult] = await Promise.all([
+        supabase
+          .from('signal_data')
+          .select('signal_type, processed_data, confidence_contribution, created_at')
+          .eq('user_id', userId)
+          .is('deleted_at', null)
+          .order('created_at', { ascending: false }),
+        supabase
+          .from('survey_responses')
+          .select('raw_answers, created_at')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .limit(1),
+      ]);
 
-    const signals = signalsResult.data ?? [];
-    const surveyAnswers =
-      (surveyResult.data?.[0]?.raw_answers as SurveyAnswers | null) ?? null;
+      if (signalsResult.error) throw signalsResult.error;
+      if (surveyResult.error) throw surveyResult.error;
 
-    // 3. Confidence breakdown — use distinct signal types (most recent wins above)
-    const distinctTypes = [...new Set(signals.map((s) => s.signal_type as string))];
-    const { breakdown, potential } = buildConfidenceBreakdown(
-      distinctTypes,
-      Number(latest.confidence_score),
-    );
+      const signals = signalsResult.data ?? [];
+      const surveyAnswers =
+        (surveyResult.data?.[0]?.raw_answers as SurveyAnswers | null) ?? null;
 
-    // 4. Most recent processed_data per signal type (for AI context)
-    const transcriptSignal = signals.find((s) => s.signal_type === 'transcript');
-    const sleepSignal      = signals.find((s) => s.signal_type === 'sleep');
-    const voiceSignal      = signals.find((s) => s.signal_type === 'voice');
+      const distinctTypes = [...new Set(signals.map((s) => s.signal_type as string))];
+      const { breakdown, potential } = buildConfidenceBreakdown(
+        distinctTypes,
+        Number(latest.confidence_score),
+      );
 
-    const clScore = Math.round(Number(latest.cognitive_load));
-    const erScore = Math.round(Number(latest.emotional_regulation));
-    const rcScore = Math.round(Number(latest.recovery_capacity));
+      const transcriptSignal = signals.find((s) => s.signal_type === 'transcript');
+      const sleepSignal      = signals.find((s) => s.signal_type === 'sleep');
+      const voiceSignal      = signals.find((s) => s.signal_type === 'voice');
 
-    // 5. Build AI prompts with actual data
-    const clPrompt = buildCognitiveLoadPrompt(
-      clScore, surveyAnswers,
-      (transcriptSignal?.processed_data as TranscriptProcessed) ?? null,
-    );
-    const erPrompt = buildEmotionalRegulationPrompt(
-      erScore, surveyAnswers,
-      (voiceSignal?.processed_data as VoiceProcessed) ?? null,
-    );
-    const rcPrompt = buildRecoveryCapacityPrompt(
-      rcScore, surveyAnswers,
-      (sleepSignal?.processed_data as SleepProcessed) ?? null,
-    );
+      const clScore = Math.round(Number(latest.cognitive_load));
+      const erScore = Math.round(Number(latest.emotional_regulation));
+      const rcScore = Math.round(Number(latest.recovery_capacity));
 
-    // 6. Three explanation calls in PARALLEL — each with its own 8s abort timeout.
-    //    Fallback on any individual failure so the whole dashboard still loads.
-    const [clExpl, erExpl, rcExpl] = await Promise.all([
-      safeExplain(
-        callAI(EXPLANATION_SYSTEM_PROMPT, clPrompt, { timeoutMs: 8_000 }),
-        'cognitive_load',
-      ),
-      safeExplain(
-        callAI(EXPLANATION_SYSTEM_PROMPT, erPrompt, { timeoutMs: 8_000 }),
-        'emotional_regulation',
-      ),
-      safeExplain(
-        callAI(EXPLANATION_SYSTEM_PROMPT, rcPrompt, { timeoutMs: 8_000 }),
-        'recovery_capacity',
-      ),
-    ]);
+      // Fetch Backboard prior context (awaited, falls back to "" silently)
+      let priorContext = '';
+      const assistantId = await getAssistantId(userId);
+      if (assistantId) {
+        priorContext = await searchMemories(
+          assistantId,
+          'dimension score history trend performance',
+        );
+      }
 
-    return res.status(200).json({
-      success: true,
-      data: {
-        user_id:      userId,
-        generated_at: new Date().toISOString(),
-        confidence: {
-          total: Number(latest.confidence_score),
-          breakdown,
-          potential,
+      const clPrompt = buildCognitiveLoadPrompt(
+        clScore, surveyAnswers,
+        (transcriptSignal?.processed_data as TranscriptProcessed) ?? null,
+        priorContext,
+      );
+      const erPrompt = buildEmotionalRegulationPrompt(
+        erScore, surveyAnswers,
+        (voiceSignal?.processed_data as VoiceProcessed) ?? null,
+        priorContext,
+      );
+      const rcPrompt = buildRecoveryCapacityPrompt(
+        rcScore, surveyAnswers,
+        (sleepSignal?.processed_data as SleepProcessed) ?? null,
+        priorContext,
+      );
+
+      const [clExpl, erExpl, rcExpl] = await Promise.all([
+        safeExplain(
+          callAI(EXPLANATION_SYSTEM_PROMPT, clPrompt, { timeoutMs: 8_000 }),
+          'cognitive_load',
+        ),
+        safeExplain(
+          callAI(EXPLANATION_SYSTEM_PROMPT, erPrompt, { timeoutMs: 8_000 }),
+          'emotional_regulation',
+        ),
+        safeExplain(
+          callAI(EXPLANATION_SYSTEM_PROMPT, rcPrompt, { timeoutMs: 8_000 }),
+          'recovery_capacity',
+        ),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          user_id:      userId,
+          generated_at: new Date().toISOString(),
+          confidence: {
+            total: Number(latest.confidence_score),
+            breakdown,
+            potential,
+          },
+          dimensions: {
+            cognitive_load: {
+              score:       clScore,
+              color:       dimensionColor(clScore, true),
+              explanation: clExpl,
+            },
+            emotional_regulation: {
+              score:       erScore,
+              color:       dimensionColor(erScore, false),
+              explanation: erExpl,
+            },
+            recovery_capacity: {
+              score:       rcScore,
+              color:       dimensionColor(rcScore, false),
+              explanation: rcExpl,
+            },
+          },
+          disclaimer: DISCLAIMER,
         },
-        dimensions: {
-          cognitive_load: {
-            score:       clScore,
-            color:       dimensionColor(clScore, true),
-            explanation: clExpl,
-          },
-          emotional_regulation: {
-            score:       erScore,
-            color:       dimensionColor(erScore, false),
-            explanation: erExpl,
-          },
-          recovery_capacity: {
-            score:       rcScore,
-            color:       dimensionColor(rcScore, false),
-            explanation: rcExpl,
-          },
-        },
-        disclaimer: DISCLAIMER,
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
-});
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 export default router;

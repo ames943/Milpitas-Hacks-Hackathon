@@ -1,18 +1,22 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { supabase } from '../lib/supabase';
 import { scorePHQA, scoreGAD7, calculateDimensions } from '../lib/scoring';
+import { getAssistantId, createAssistant } from '../lib/backboardMemory';
+import { stripHtml } from '../lib/utils';
 
 const router = Router();
 
 // POST /api/survey
-// Body: { user_id: string, phq_answers: number[9], gad_answers: number[7] }
-// Each answer is an integer 0-3 (standard PHQ-A / GAD-7 Likert scale).
+// Body: { user_id: string, phq_answers: number[9], gad_answers: number[7],
+//         email?: string, name?: string }
 router.post('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { user_id, phq_answers, gad_answers } = req.body as {
+    const { user_id, phq_answers, gad_answers, email, name } = req.body as {
       user_id?: string;
       phq_answers?: unknown;
       gad_answers?: unknown;
+      email?: unknown;
+      name?: unknown;
     };
 
     if (!user_id || typeof user_id !== 'string') {
@@ -40,8 +44,17 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       });
     }
 
-    // raw_answers is constructed explicitly from validated arrays only —
-    // extra fields from req.body are never forwarded here.
+    // Upsert user row (create if not exists, update name/email if provided)
+    const upsertPayload: Record<string, unknown> = { id: user_id };
+    if (email && typeof email === 'string') upsertPayload.email = email;
+    if (name && typeof name === 'string') {
+      upsertPayload.name = stripHtml(name.trim()).substring(0, 100);
+    }
+    await supabase
+      .from('users')
+      .upsert(upsertPayload, { onConflict: 'id', ignoreDuplicates: false });
+
+    // raw_answers is constructed explicitly from validated arrays only.
     const { data: surveyRow, error: surveyErr } = await supabase
       .from('survey_responses')
       .insert({
@@ -55,9 +68,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
 
     if (surveyErr) throw surveyErr;
 
-    // Fetch the user's latest confidence score before inserting a new dimension_scores row.
-    // Survey resubmission resets the three dimension values to survey-only baselines, but
-    // must NOT lower confidence that was already raised by transcript/sleep/voice signals.
+    // Fetch prior confidence + check if this is the first survey
     const { data: priorRows, error: priorErr } = await supabase
       .from('dimension_scores')
       .select('confidence_score')
@@ -67,17 +78,17 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
 
     if (priorErr) throw priorErr;
 
+    const isFirstSurvey = (priorRows ?? []).length === 0;
     const priorConfidence = Number(priorRows?.[0]?.confidence_score ?? 0);
-    // Floor is 40 (survey-only baseline); preserve any higher value from signals.
     const confidence_score = Math.max(40, priorConfidence);
 
     const { data: dimRow, error: dimErr } = await supabase
       .from('dimension_scores')
       .insert({
         user_id,
-        cognitive_load: dimensions.cognitive_load,
+        cognitive_load:       dimensions.cognitive_load,
         emotional_regulation: dimensions.emotional_regulation,
-        recovery_capacity: dimensions.recovery_capacity,
+        recovery_capacity:    dimensions.recovery_capacity,
         confidence_score,
         explanation_text:
           confidence_score > 40
@@ -88,6 +99,17 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       .single();
 
     if (dimErr) throw dimErr;
+
+    // Create Backboard assistant on first survey (fire-and-forget)
+    if (isFirstSurvey) {
+      getAssistantId(user_id).then((existingId) => {
+        if (!existingId) {
+          createAssistant(user_id).catch((err) =>
+            console.warn('[survey] Backboard assistant creation failed (non-fatal):', err),
+          );
+        }
+      }).catch(() => {});
+    }
 
     return res.status(201).json({
       success: true,

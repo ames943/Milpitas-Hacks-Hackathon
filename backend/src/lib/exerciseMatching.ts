@@ -1,11 +1,5 @@
 /**
  * Exercise recommendation engine — two-stage: deterministic pre-filter, then AI ranking.
- *
- * Stage 1 (pure, synchronous): build a priority category set from dimension scores,
- * score each exercise, return top-8 candidates.
- *
- * Stage 2 (AI): pass candidates + student context to Backboard/Claude, receive
- * exactly 5 recommendations with personalized match_reasons.
  */
 
 import { callAI } from './aiClient';
@@ -22,6 +16,7 @@ export interface ExerciseRow {
   description: string | null;
   full_ui: boolean;
   instructions: unknown | null;
+  counselor_flag?: boolean;
 }
 
 export interface SignalDataRow {
@@ -40,22 +35,6 @@ export interface RecommendedExercise {
   match_reason: string;
   match_score: number;
 }
-
-// ── Category-to-dimension mapping (research-informed starting point) ──────────
-// cognitive_load:         higher = worse (strain)
-//   red   (≥ 67): prioritize Cognitive + Structural — reduce mental load directly
-//   amber (34-66): prioritize Structural — routine/planning to prevent escalation
-//   green (< 34): no priority boost
-
-// emotional_regulation:   higher = better
-//   red   (≤ 33): prioritize Cognitive + Social — reframe AND connect
-//   amber (34-66): prioritize Cognitive — build regulation skills
-//   green (> 66): no priority boost
-
-// recovery_capacity:      higher = better
-//   red   (≤ 33): prioritize Physical + Structural — sleep and rest scaffolding
-//   amber (34-66): prioritize Physical — basic sleep/movement hygiene
-//   green (> 66): no priority boost
 
 // ── Stage 1: Pure functions ───────────────────────────────────────────────────
 
@@ -106,17 +85,10 @@ export function selectCandidates(
     exercise,
     match_score: scoreExercise(exercise.categories ?? [], prioritySet),
   }));
-  // Sort descending by match_score (stable — preserves seed order on ties)
   scored.sort((a, b) => b.match_score - a.match_score);
   return scored.slice(0, count);
 }
 
-// Ensures at least one recommendation has full_ui=true so the demo always has
-// an interactive exercise to tap into.  If all 5 AI picks are non-interactive:
-//   • Find the highest-match-score full_ui exercise in the candidate pool
-//     that is NOT already in the 5.
-//   • Replace the recommendation with the lowest match_score with it.
-//   • Logs a warning — this swap bypasses the AI selection.
 export function ensureFullUiGuarantee(
   recommendations: RecommendedExercise[],
   candidates: CandidateExercise[],
@@ -248,12 +220,20 @@ function buildMatchUserPrompt(
   scores: DimensionScoresRow,
   candidates: CandidateExercise[],
   signalData: SignalDataRow[],
+  priorContext: string,
 ): string {
   const cl = Math.round(Number(scores.cognitive_load));
   const er = Math.round(Number(scores.emotional_regulation));
   const rc = Math.round(Number(scores.recovery_capacity));
 
-  const sections: string[] = [
+  const sections: string[] = [];
+
+  if (priorContext) {
+    sections.push(priorContext);
+    sections.push('');
+  }
+
+  sections.push(
     `STUDENT DIMENSION SCORES\n`,
     `1. Cognitive Load (${levelLabel('load', cl)}): Measures how much mental bandwidth is being consumed. Higher = more strain.`,
     `   Color: ${dimensionColor(cl, true)} | Score: ${cl}/100`,
@@ -272,7 +252,7 @@ function buildMatchUserPrompt(
       `ID: ${e.id}\nName: ${e.name}\nCategories: ${(e.categories ?? []).join(', ')}\nDescription: ${e.description ?? '(no description)'}\nMatch score: ${match_score}\n`,
     ),
     `Select the 5 exercises that best address this student's specific combination of needs. Return JSON only.`,
-  ];
+  );
 
   return sections.join('\n');
 }
@@ -314,16 +294,15 @@ export async function matchExercises(
   dimensionScores: DimensionScoresRow,
   signalData: SignalDataRow[],
   allExercises: ExerciseRow[],
+  priorContext = '',
 ): Promise<RecommendedExercise[]> {
-  // Stage 1 — deterministic pre-filter
   const prioritySet = buildPrioritySet(dimensionScores);
-  const candidates = selectCandidates(allExercises, prioritySet, 8);
+  const candidates  = selectCandidates(allExercises, prioritySet, 8);
 
-  // Stage 2 — AI ranking
-  const userPrompt = buildMatchUserPrompt(dimensionScores, candidates, signalData);
-  const rawResult = await callAI(MATCH_SYSTEM_PROMPT, userPrompt, {
+  const userPrompt = buildMatchUserPrompt(dimensionScores, candidates, signalData, priorContext);
+  const rawResult  = await callAI(MATCH_SYSTEM_PROMPT, userPrompt, {
     jsonOutput: true,
-    timeoutMs: 12_000, // allow a bit more time since it reads more context
+    timeoutMs: 12_000,
   });
 
   const validIds = new Set(candidates.map((c) => c.exercise.id));
@@ -344,6 +323,5 @@ export async function matchExercises(
     };
   });
 
-  // full_ui guarantee — swap if needed
   return ensureFullUiGuarantee(recommendations, candidates);
 }

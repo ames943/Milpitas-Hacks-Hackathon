@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { getAssistantId, addMemory, formatSnapshotMemory } from './backboardMemory';
 
 export interface DimensionScoresRow {
   id: string;
@@ -32,6 +33,39 @@ export type DimensionAdjustments = Partial<{
 
 function clamp(v: number): number {
   return Math.max(0, Math.min(100, Math.round(v)));
+}
+
+// ── Backboard snapshot write (fire-and-forget) ────────────────────────────────
+// Queries active signals, formats the memory string, and posts to Backboard.
+// Never throws — all failures are logged as warnings.
+async function writeBackboardSnapshot(userId: string, row: DimensionScoresRow): Promise<void> {
+  const assistantId = await getAssistantId(userId);
+  if (!assistantId) {
+    console.warn('[dimensionUpdate] No Backboard assistant for user — snapshot skipped');
+    return;
+  }
+
+  // Query distinct active signal types (excludes soft-deleted rows)
+  const { data: sigData } = await supabase
+    .from('signal_data')
+    .select('signal_type')
+    .eq('user_id', userId)
+    .is('deleted_at', null);
+
+  const signalsPresent = [
+    ...new Set(
+      (sigData ?? []).map((s: { signal_type: string }) => s.signal_type as string),
+    ),
+  ];
+
+  const content = formatSnapshotMemory(row, signalsPresent);
+  const metadata = {
+    source:      'mosaic',
+    user_id:     userId,
+    snapshot_at: row.created_at,
+  };
+
+  await addMemory(assistantId, content, metadata);
 }
 
 /**
@@ -73,5 +107,12 @@ export async function blendAndInsertDimensions(
     .single();
 
   if (error) throw error;
-  return data as DimensionScoresRow;
+  const row = data as DimensionScoresRow;
+
+  // Fire-and-forget — Backboard write failure must never crash the request.
+  writeBackboardSnapshot(userId, row).catch((err) =>
+    console.warn('[dimensionUpdate] Backboard snapshot write failed (non-fatal):', err),
+  );
+
+  return row;
 }
