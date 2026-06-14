@@ -1,6 +1,6 @@
-/** UUID v4 pattern — used for all :userId and :id param validation. */
+/** UUID pattern — accepts any RFC 4122 UUID format (v1–v5) to support demo student IDs. */
 export const UUID_V4_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function validateUUID(id: string): boolean {
   return UUID_V4_REGEX.test(id);

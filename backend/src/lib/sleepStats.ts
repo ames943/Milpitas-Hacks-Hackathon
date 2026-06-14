@@ -19,6 +19,8 @@ export interface SleepStats {
 const DATE_COLUMN_CANDIDATES = ['date', 'startdate', 'start date'];
 const DURATION_COLUMN_CANDIDATES = [
   'sleep_duration_hours',
+  'totalsleephours',
+  'total sleep hours',
   'value',
   'duration',
   'sleep analysis [asleep] (hr)',

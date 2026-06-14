@@ -234,14 +234,18 @@ router.get(
       const erScore = Math.round(Number(latest.emotional_regulation));
       const rcScore = Math.round(Number(latest.recovery_capacity));
 
-      // Fetch Backboard prior context (awaited, falls back to "" silently)
+      // Fetch Backboard prior context — race against 3s to keep dashboard latency bounded
       let priorContext = '';
-      const assistantId = await getAssistantId(userId);
-      if (assistantId) {
-        priorContext = await searchMemories(
-          assistantId,
-          'dimension score history trend performance',
-        );
+      try {
+        const assistantId = await getAssistantId(userId);
+        if (assistantId) {
+          priorContext = await Promise.race([
+            searchMemories(assistantId, 'dimension score history trend performance'),
+            new Promise<string>((_, rej) => setTimeout(() => rej(new Error('timeout')), 3_000)),
+          ]);
+        }
+      } catch {
+        // prior context is best-effort; proceed without it
       }
 
       const clPrompt = buildCognitiveLoadPrompt(

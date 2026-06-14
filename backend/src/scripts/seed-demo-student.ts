@@ -58,7 +58,8 @@ async function run(): Promise<void> {
     phq_a_score: 6,
     gad7_score:  7,
     raw_answers: {
-      note: 'Demo student baseline — moderate scores on survey alone, decline hidden in signals.',
+      phq_answers: [1, 1, 0, 1, 0, 1, 1, 1, 0],
+      gad_answers: [1, 1, 1, 1, 1, 1, 1],
     },
     created_at: weeksAgo(5),
   });

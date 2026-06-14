@@ -6,8 +6,12 @@ import { getAssistantId, searchMemories } from '../lib/backboardMemory';
 import {
   matchExercises,
   ExerciseMatchValidationError,
+  buildPrioritySet,
+  selectCandidates,
+  ensureFullUiGuarantee,
   type ExerciseRow,
   type SignalDataRow,
+  type RecommendedExercise,
 } from '../lib/exerciseMatching';
 import { validateUUID, VALID_EXERCISE_CATEGORIES, MAX_COMPLETION_DATA_BYTES } from '../lib/utils';
 const router = Router();
@@ -198,19 +202,37 @@ router.get(
       const signalData    = (signalsResult.data ?? []) as SignalDataRow[];
       const allExercises  = (exercisesResult.data ?? []) as ExerciseRow[];
 
-      // Fetch Backboard prior context
+      // Fetch Backboard prior context — race against 3s to keep total latency bounded
       let priorContext = '';
-      const assistantId = await getAssistantId(userId);
-      if (assistantId) {
-        priorContext = await searchMemories(
-          assistantId,
-          'dimension score history trend performance',
-        );
+      try {
+        const assistantId = await getAssistantId(userId);
+        if (assistantId) {
+          priorContext = await Promise.race([
+            searchMemories(assistantId, 'dimension score history trend performance'),
+            new Promise<string>((_, rej) => setTimeout(() => rej(new Error('timeout')), 3_000)),
+          ]);
+        }
+      } catch {
+        // prior context is best-effort; proceed without it
       }
 
-      const recommendations = await matchExercises(
-        latestScores, signalData, allExercises, priorContext,
-      );
+      let recommendations: RecommendedExercise[];
+      try {
+        recommendations = await matchExercises(
+          latestScores, signalData, allExercises, priorContext,
+        );
+      } catch (aiErr) {
+        // AI timed out or failed — fall back to deterministic top-5 so the response always succeeds
+        console.warn('[exercises/recommended] AI match failed, using deterministic fallback:', (aiErr as Error).message);
+        const prioritySet = buildPrioritySet(latestScores);
+        const candidates  = selectCandidates(allExercises, prioritySet, 8);
+        const fallback: RecommendedExercise[] = candidates.slice(0, 5).map((c) => ({
+          exercise:     c.exercise,
+          match_score:  c.match_score,
+          match_reason: c.exercise.description || 'This exercise is a strong match for your current patterns.',
+        }));
+        recommendations = ensureFullUiGuarantee(fallback, candidates);
+      }
 
       const cl = Math.round(Number(latestScores.cognitive_load));
       const er = Math.round(Number(latestScores.emotional_regulation));

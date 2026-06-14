@@ -138,7 +138,7 @@ export interface TranscriptData {
 }
 
 export async function extractTranscriptData(transcriptText: string): Promise<TranscriptData> {
-  const result = await callAI(TRANSCRIPT_SYSTEM_PROMPT, transcriptText, { jsonOutput: true }) as Record<string, unknown>;
+  const result = await callAI(TRANSCRIPT_SYSTEM_PROMPT, transcriptText, { jsonOutput: true, timeoutMs: 25_000 }) as Record<string, unknown>;
 
   if (
     typeof result.gpa !== 'number' ||
