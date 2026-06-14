@@ -266,15 +266,15 @@ router.get(
 
       const [clExpl, erExpl, rcExpl] = await Promise.all([
         safeExplain(
-          callAI(EXPLANATION_SYSTEM_PROMPT, clPrompt, { timeoutMs: 8_000 }),
+          callAI(EXPLANATION_SYSTEM_PROMPT, clPrompt, { timeoutMs: 15_000 }),
           'cognitive_load',
         ),
         safeExplain(
-          callAI(EXPLANATION_SYSTEM_PROMPT, erPrompt, { timeoutMs: 8_000 }),
+          callAI(EXPLANATION_SYSTEM_PROMPT, erPrompt, { timeoutMs: 15_000 }),
           'emotional_regulation',
         ),
         safeExplain(
-          callAI(EXPLANATION_SYSTEM_PROMPT, rcPrompt, { timeoutMs: 8_000 }),
+          callAI(EXPLANATION_SYSTEM_PROMPT, rcPrompt, { timeoutMs: 15_000 }),
           'recovery_capacity',
         ),
       ]);

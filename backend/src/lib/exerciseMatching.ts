@@ -302,7 +302,7 @@ export async function matchExercises(
   const userPrompt = buildMatchUserPrompt(dimensionScores, candidates, signalData, priorContext);
   const rawResult  = await callAI(MATCH_SYSTEM_PROMPT, userPrompt, {
     jsonOutput: true,
-    timeoutMs: 12_000,
+    timeoutMs: 8_000,
   });
 
   const validIds = new Set(candidates.map((c) => c.exercise.id));
