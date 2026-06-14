@@ -12,7 +12,7 @@ import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 
 import { supabase } from '../lib/supabase';
-import { extractTranscriptData, ClaudeParseError } from '../lib/claudeClient';
+import { extractTranscriptData, AIParseError as ClaudeParseError } from '../lib/aiClient';
 import { getLatestDimensionScores, blendAndInsertDimensions } from '../lib/dimensionUpdate';
 import {
   computeNewCognitiveLoad,
