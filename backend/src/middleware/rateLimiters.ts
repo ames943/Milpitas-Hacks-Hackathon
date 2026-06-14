@@ -1,4 +1,4 @@
-import rateLimit, { MemoryStore, ipKeyGenerator } from 'express-rate-limit';
+import rateLimit, { MemoryStore } from 'express-rate-limit';
 import type { Request, Response } from 'express';
 
 function tooManyHandler(req: Request, res: Response): void {
@@ -17,7 +17,7 @@ export const userCreateLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 10,
   store: userCreateStore,
-  keyGenerator: (req) => ipKeyGenerator(req),
+  keyGenerator: (req) => req.ip ?? 'unknown',
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: tooManyHandler,
@@ -29,7 +29,7 @@ export const surveyLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 5,
   keyGenerator: (req) =>
-    (req.body?.user_id as string | undefined) ?? ipKeyGenerator(req),
+    (req.body?.user_id as string | undefined) ?? req.ip ?? 'unknown',
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: tooManyHandler,
@@ -41,7 +41,7 @@ export const surveyLimiter = rateLimit({
 export const signalLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 10,
-  keyGenerator: (req) => `${ipKeyGenerator(req)}:${req.path}`,
+  keyGenerator: (req) => `${req.ip ?? 'unknown'}:${req.path}`,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: tooManyHandler,
@@ -52,7 +52,7 @@ export const dashboardLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 30,
   keyGenerator: (req) =>
-    (req.params.userId as string | undefined) ?? ipKeyGenerator(req),
+    (req.params.userId as string | undefined) ?? req.ip ?? 'unknown',
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: tooManyHandler,
@@ -63,7 +63,7 @@ export const recommendedLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 20,
   keyGenerator: (req) =>
-    (req.params.userId as string | undefined) ?? ipKeyGenerator(req),
+    (req.params.userId as string | undefined) ?? req.ip ?? 'unknown',
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: tooManyHandler,
@@ -73,7 +73,7 @@ export const recommendedLimiter = rateLimit({
 export const voicePromptLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 100,
-  keyGenerator: (req) => ipKeyGenerator(req),
+  keyGenerator: (req) => req.ip ?? 'unknown',
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   handler: tooManyHandler,
